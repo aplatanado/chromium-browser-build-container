@@ -1,0 +1,390 @@
+--- chromium-browser-80.0.3987.87.orig/third_party/webrtc/AUTHORS
++++ chromium-browser-80.0.3987.87/third_party/webrtc/AUTHORS
+@@ -60,6 +60,7 @@ Silviu Caragea <silviu.cpp@gmail.com>
+ Stefan Gula <steweg@gmail.com>
+ Steve Reid <sreid@sea-to-sky.net>
+ Tarun Chawla <trnkumarchawla@gmail.com>
++Trevor Hayes <trevor.axiom@gmail.com>
+ Uladzislau Susha <landby@gmail.com>
+ Vladimir Beloborodov <VladimirTechMan@gmail.com>
+ Vicken Simonian <vsimon@gmail.com>
+--- chromium-browser-80.0.3987.87.orig/third_party/webrtc/modules/desktop_capture/BUILD.gn
++++ chromium-browser-80.0.3987.87/third_party/webrtc/modules/desktop_capture/BUILD.gn
+@@ -393,6 +393,7 @@ rtc_library("desktop_capture_generic") {
+       "Xext",
+       "Xfixes",
+       "Xrender",
++      "Xrandr",
+     ]
+   }
+ 
+@@ -479,6 +480,10 @@ rtc_library("desktop_capture_generic") {
+     "//third_party/abseil-cpp/absl/strings",
+   ]
+ 
++  if (rtc_use_x11_extensions) {
++    deps += [ "../../rtc_base:sanitizer" ]
++  }
++
+   if (build_with_mozilla) {
+     deps += [ "../../rtc_base:rtc_base_approved" ]
+   } else {
+--- chromium-browser-80.0.3987.87.orig/third_party/webrtc/modules/desktop_capture/desktop_geometry.h
++++ chromium-browser-80.0.3987.87/third_party/webrtc/modules/desktop_capture/desktop_geometry.h
+@@ -43,6 +43,8 @@ class DesktopVector {
+     return DesktopVector(x() - other.x(), y() - other.y());
+   }
+ 
++  DesktopVector operator-() const { return DesktopVector(-x_, -y_); }
++
+  private:
+   int32_t x_;
+   int32_t y_;
+--- chromium-browser-80.0.3987.87.orig/third_party/webrtc/modules/desktop_capture/linux/screen_capturer_x11.cc
++++ chromium-browser-80.0.3987.87/third_party/webrtc/modules/desktop_capture/linux/screen_capturer_x11.cc
+@@ -14,6 +14,7 @@
+ #include <X11/extensions/Xdamage.h>
+ #include <X11/extensions/Xfixes.h>
+ #include <X11/extensions/damagewire.h>
++#include <dlfcn.h>
+ #include <stdint.h>
+ #include <string.h>
+ 
+@@ -30,6 +31,7 @@
+ #include "modules/desktop_capture/shared_desktop_frame.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/logging.h"
++#include "rtc_base/sanitizer.h"
+ #include "rtc_base/time_utils.h"
+ #include "rtc_base/trace_event.h"
+ 
+@@ -45,6 +47,10 @@ ScreenCapturerX11::~ScreenCapturerX11()
+     options_.x_display()->RemoveEventHandler(damage_event_base_ + XDamageNotify,
+                                              this);
+   }
++  if (use_randr_) {
++    options_.x_display()->RemoveEventHandler(
++        randr_event_base_ + RRScreenChangeNotify, this);
++  }
+   DeinitXlib();
+ }
+ 
+@@ -92,6 +98,11 @@ bool ScreenCapturerX11::Init(const Deskt
+     InitXDamage();
+   }
+ 
++  InitXrandr();
++
++  // Default source set here so that selected_monitor_rect_ is sized correctly.
++  SelectSource(kFullDesktopScreenId);
++
+   return true;
+ }
+ 
+@@ -136,6 +147,75 @@ void ScreenCapturerX11::InitXDamage() {
+   RTC_LOG(LS_INFO) << "Using XDamage extension.";
+ }
+ 
++RTC_NO_SANITIZE("cfi-icall")
++void ScreenCapturerX11::InitXrandr() {
++  int major_version = 0;
++  int minor_version = 0;
++  int error_base_ignored = 0;
++  if (XRRQueryExtension(display(), &randr_event_base_, &error_base_ignored) &&
++      XRRQueryVersion(display(), &major_version, &minor_version)) {
++    if (major_version > 1 || (major_version == 1 && minor_version >= 5)) {
++      // Dynamically link XRRGetMonitors and XRRFreeMonitors as a workaround
++      // to avoid a dependency issue with Debian 8.
++      get_monitors_ = reinterpret_cast<get_monitors_func>(
++          dlsym(RTLD_DEFAULT, "XRRGetMonitors"));
++      free_monitors_ = reinterpret_cast<free_monitors_func>(
++          dlsym(RTLD_DEFAULT, "XRRFreeMonitors"));
++      if (get_monitors_ && free_monitors_) {
++        use_randr_ = true;
++        RTC_LOG(LS_INFO) << "Using XRandR extension v" << major_version << '.'
++                         << minor_version << '.';
++        monitors_ =
++            get_monitors_(display(), root_window_, true, &num_monitors_);
++
++        // Register for screen change notifications
++        XRRSelectInput(display(), root_window_, RRScreenChangeNotifyMask);
++        options_.x_display()->AddEventHandler(
++            randr_event_base_ + RRScreenChangeNotify, this);
++      } else {
++        RTC_LOG(LS_ERROR) << "Unable to link XRandR monitor functions.";
++      }
++    } else {
++      RTC_LOG(LS_ERROR) << "XRandR entension is older than v1.5.";
++    }
++  } else {
++    RTC_LOG(LS_ERROR) << "X server does not support XRandR.";
++  }
++}
++
++RTC_NO_SANITIZE("cfi-icall")
++void ScreenCapturerX11::UpdateMonitors() {
++  if (monitors_) {
++    free_monitors_(monitors_);
++    monitors_ = nullptr;
++  }
++
++  monitors_ = get_monitors_(display(), root_window_, true, &num_monitors_);
++
++  if (selected_monitor_name_) {
++    if (selected_monitor_name_ == static_cast<Atom>(kFullDesktopScreenId)) {
++      selected_monitor_rect_ =
++          DesktopRect::MakeSize(x_server_pixel_buffer_.window_size());
++      return;
++    }
++
++    for (int i = 0; i < num_monitors_; ++i) {
++      XRRMonitorInfo& m = monitors_[i];
++      if (selected_monitor_name_ == m.name) {
++        RTC_LOG(LS_INFO) << "XRandR monitor " << m.name << " rect updated.";
++        selected_monitor_rect_ =
++            DesktopRect::MakeXYWH(m.x, m.y, m.width, m.height);
++        return;
++      }
++    }
++
++    // The selected monitor is not connected anymore
++    RTC_LOG(LS_INFO) << "XRandR selected monitor " << selected_monitor_name_
++                     << " lost.";
++    selected_monitor_rect_ = DesktopRect::MakeWH(0, 0);
++  }
++}
++
+ void ScreenCapturerX11::Start(Callback* callback) {
+   RTC_DCHECK(!callback_);
+   RTC_DCHECK(callback);
+@@ -167,9 +247,13 @@ void ScreenCapturerX11::CaptureFrame() {
+   // Note that we can't reallocate other buffers at this point, since the caller
+   // may still be reading from them.
+   if (!queue_.current_frame()) {
+-    queue_.ReplaceCurrentFrame(
+-        SharedDesktopFrame::Wrap(std::unique_ptr<DesktopFrame>(
+-            new BasicDesktopFrame(x_server_pixel_buffer_.window_size()))));
++    std::unique_ptr<DesktopFrame> frame(
++        new BasicDesktopFrame(selected_monitor_rect_.size()));
++
++    // We set the top-left of the frame so the mouse cursor will be composited
++    // properly, and our frame buffer will not be overrun while blitting.
++    frame->set_top_left(selected_monitor_rect_.top_left());
++    queue_.ReplaceCurrentFrame(SharedDesktopFrame::Wrap(std::move(frame)));
+   }
+ 
+   std::unique_ptr<DesktopFrame> result = CaptureScreen();
+@@ -187,14 +271,46 @@ void ScreenCapturerX11::CaptureFrame() {
+ 
+ bool ScreenCapturerX11::GetSourceList(SourceList* sources) {
+   RTC_DCHECK(sources->size() == 0);
+-  // TODO(jiayl): implement screen enumeration.
+-  sources->push_back({0});
++  if (!use_randr_) {
++    sources->push_back({});
++    return true;
++  }
++
++  // Ensure that |monitors_| is updated with changes that may have happened
++  // between calls to GetSourceList().
++  options_.x_display()->ProcessPendingXEvents();
++
++  for (int i = 0; i < num_monitors_; ++i) {
++    XRRMonitorInfo& m = monitors_[i];
++    char* monitor_title = XGetAtomName(display(), m.name);
++
++    // Note name is an X11 Atom used to id the monitor.
++    sources->push_back({static_cast<SourceId>(m.name), monitor_title});
++    XFree(monitor_title);
++  }
++
+   return true;
+ }
+ 
+ bool ScreenCapturerX11::SelectSource(SourceId id) {
+-  // TODO(jiayl): implement screen selection.
+-  return true;
++  if (!use_randr_ || id == kFullDesktopScreenId) {
++    selected_monitor_name_ = kFullDesktopScreenId;
++    selected_monitor_rect_ =
++        DesktopRect::MakeSize(x_server_pixel_buffer_.window_size());
++    return true;
++  }
++
++  for (int i = 0; i < num_monitors_; ++i) {
++    if (id == static_cast<SourceId>(monitors_[i].name)) {
++      RTC_LOG(LS_INFO) << "XRandR selected source: " << id;
++      XRRMonitorInfo& m = monitors_[i];
++      selected_monitor_name_ = m.name;
++      selected_monitor_rect_ =
++          DesktopRect::MakeXYWH(m.x, m.y, m.width, m.height);
++      return true;
++    }
++  }
++  return false;
+ }
+ 
+ bool ScreenCapturerX11::HandleXEvent(const XEvent& event) {
+@@ -205,6 +321,12 @@ bool ScreenCapturerX11::HandleXEvent(con
+       return false;
+     RTC_DCHECK(damage_event->level == XDamageReportNonEmpty);
+     return true;
++  } else if (use_randr_ &&
++             event.type == randr_event_base_ + RRScreenChangeNotify) {
++    XRRUpdateConfiguration(const_cast<XEvent*>(&event));
++    UpdateMonitors();
++    RTC_LOG(LS_INFO) << "XRandR screen change event received.";
++    return true;
+   } else if (event.type == ConfigureNotify) {
+     ScreenConfigurationChanged();
+     return true;
+@@ -214,11 +336,11 @@ bool ScreenCapturerX11::HandleXEvent(con
+ 
+ std::unique_ptr<DesktopFrame> ScreenCapturerX11::CaptureScreen() {
+   std::unique_ptr<SharedDesktopFrame> frame = queue_.current_frame()->Share();
+-  RTC_DCHECK(x_server_pixel_buffer_.window_size().equals(frame->size()));
++  RTC_DCHECK(selected_monitor_rect_.size().equals(frame->size()));
+ 
+   // Pass the screen size to the helper, so it can clip the invalid region if it
+   // expands that region to a grid.
+-  helper_.set_size_most_recent(frame->size());
++  helper_.set_size_most_recent(x_server_pixel_buffer_.window_size());
+ 
+   // In the DAMAGE case, ensure the frame is up-to-date with the previous frame
+   // if any.  If there isn't a previous frame, that means a screen-resolution
+@@ -246,12 +368,7 @@ std::unique_ptr<DesktopFrame> ScreenCapt
+ 
+     // Capture the damaged portions of the desktop.
+     helper_.TakeInvalidRegion(updated_region);
+-
+-    // Clip the damaged portions to the current screen size, just in case some
+-    // spurious XDamage notifications were received for a previous (larger)
+-    // screen size.
+-    updated_region->IntersectWith(
+-        DesktopRect::MakeSize(x_server_pixel_buffer_.window_size()));
++    updated_region->IntersectWith(selected_monitor_rect_);
+ 
+     for (DesktopRegion::Iterator it(*updated_region); !it.IsAtEnd();
+          it.Advance()) {
+@@ -261,10 +378,11 @@ std::unique_ptr<DesktopFrame> ScreenCapt
+   } else {
+     // Doing full-screen polling, or this is the first capture after a
+     // screen-resolution change.  In either case, need a full-screen capture.
+-    DesktopRect screen_rect = DesktopRect::MakeSize(frame->size());
+-    if (!x_server_pixel_buffer_.CaptureRect(screen_rect, frame.get()))
++    if (!x_server_pixel_buffer_.CaptureRect(selected_monitor_rect_,
++                                            frame.get())) {
+       return nullptr;
+-    updated_region->SetRect(screen_rect);
++    }
++    updated_region->SetRect(selected_monitor_rect_);
+   }
+ 
+   return std::move(frame);
+@@ -281,6 +399,11 @@ void ScreenCapturerX11::ScreenConfigurat
+     RTC_LOG(LS_ERROR) << "Failed to initialize pixel buffer after screen "
+                          "configuration change.";
+   }
++
++  if (!use_randr_) {
++    selected_monitor_rect_ =
++        DesktopRect::MakeSize(x_server_pixel_buffer_.window_size());
++  }
+ }
+ 
+ void ScreenCapturerX11::SynchronizeFrame() {
+@@ -299,11 +422,21 @@ void ScreenCapturerX11::SynchronizeFrame
+   RTC_DCHECK(current != last);
+   for (DesktopRegion::Iterator it(last_invalid_region_); !it.IsAtEnd();
+        it.Advance()) {
+-    current->CopyPixelsFrom(*last, it.rect().top_left(), it.rect());
++    if (selected_monitor_rect_.ContainsRect(it.rect())) {
++      DesktopRect r = it.rect();
++      r.Translate(-selected_monitor_rect_.top_left());
++      current->CopyPixelsFrom(*last, r.top_left(), r);
++    }
+   }
+ }
+ 
++RTC_NO_SANITIZE("cfi-icall")
+ void ScreenCapturerX11::DeinitXlib() {
++  if (monitors_) {
++    free_monitors_(monitors_);
++    monitors_ = nullptr;
++  }
++
+   if (gc_) {
+     XFreeGC(display(), gc_);
+     gc_ = nullptr;
+--- chromium-browser-80.0.3987.87.orig/third_party/webrtc/modules/desktop_capture/linux/screen_capturer_x11.h
++++ chromium-browser-80.0.3987.87/third_party/webrtc/modules/desktop_capture/linux/screen_capturer_x11.h
+@@ -15,6 +15,7 @@
+ #include <X11/Xlib.h>
+ #include <X11/extensions/Xdamage.h>
+ #include <X11/extensions/Xfixes.h>
++#include <X11/extensions/Xrandr.h>
+ 
+ #include <memory>
+ 
+@@ -64,6 +65,8 @@ class ScreenCapturerX11 : public Desktop
+   bool HandleXEvent(const XEvent& event) override;
+ 
+   void InitXDamage();
++  void InitXrandr();
++  void UpdateMonitors();
+ 
+   // Capture screen pixels to the current buffer in the queue. In the DAMAGE
+   // case, the ScreenCapturerHelper already holds the list of invalid rectangles
+@@ -92,6 +95,22 @@ class ScreenCapturerX11 : public Desktop
+   GC gc_ = nullptr;
+   Window root_window_ = BadValue;
+ 
++  // XRandR 1.5 monitors.
++  bool use_randr_ = false;
++  int randr_event_base_ = 0;
++  XRRMonitorInfo* monitors_ = nullptr;
++  int num_monitors_ = 0;
++  DesktopRect selected_monitor_rect_;
++  // selected_monitor_name_ will be changed to kFullDesktopScreenId
++  // by a call to SelectSource() at the end of Init() because
++  // selected_monitor_rect_ should be updated as well.
++  // Setting it to kFullDesktopScreenId here might be misleading.
++  Atom selected_monitor_name_ = 0;
++  typedef XRRMonitorInfo* (*get_monitors_func)(Display*, Window, Bool, int*);
++  typedef void (*free_monitors_func)(XRRMonitorInfo*);
++  get_monitors_func get_monitors_ = nullptr;
++  free_monitors_func free_monitors_ = nullptr;
++
+   // XFixes.
+   bool has_xfixes_ = false;
+   int xfixes_event_base_ = -1;
+--- chromium-browser-80.0.3987.87.orig/third_party/webrtc/modules/desktop_capture/linux/x_server_pixel_buffer.cc
++++ chromium-browser-80.0.3987.87/third_party/webrtc/modules/desktop_capture/linux/x_server_pixel_buffer.cc
+@@ -66,8 +66,12 @@ void FastBlit(XImage* x_image,
+               uint8_t* src_pos,
+               const DesktopRect& rect,
+               DesktopFrame* frame) {
++  RTC_DCHECK_LE(frame->top_left().x(), rect.left());
++  RTC_DCHECK_LE(frame->top_left().y(), rect.top());
++
+   int src_stride = x_image->bytes_per_line;
+-  int dst_x = rect.left(), dst_y = rect.top();
++  int dst_x = rect.left() - frame->top_left().x();
++  int dst_y = rect.top() - frame->top_left().y();
+ 
+   uint8_t* dst_pos = frame->data() + frame->stride() * dst_y;
+   dst_pos += dst_x * DesktopFrame::kBytesPerPixel;
+@@ -85,8 +89,12 @@ void SlowBlit(XImage* x_image,
+               uint8_t* src_pos,
+               const DesktopRect& rect,
+               DesktopFrame* frame) {
++  RTC_DCHECK_LE(frame->top_left().x(), rect.left());
++  RTC_DCHECK_LE(frame->top_left().y(), rect.top());
++
+   int src_stride = x_image->bytes_per_line;
+-  int dst_x = rect.left(), dst_y = rect.top();
++  int dst_x = rect.left() - frame->top_left().x();
++  int dst_y = rect.top() - frame->top_left().y();
+   int width = rect.width(), height = rect.height();
+ 
+   uint32_t red_mask = x_image->red_mask;
